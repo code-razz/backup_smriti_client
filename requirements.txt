@@ -1,0 +1,16 @@
+bidict==0.23.1
+certifi==2025.8.3
+cffi==2.0.0
+charset-normalizer==3.4.3
+h11==0.16.0
+idna==3.10
+numpy==2.3.3
+pycparser==2.23
+python-engineio==4.12.2
+python-socketio==5.13.0
+requests==2.32.5
+simple-websocket==1.1.0
+sounddevice==0.5.2
+urllib3==2.5.0
+websocket-client==1.8.0
+wsproto==1.2.0
