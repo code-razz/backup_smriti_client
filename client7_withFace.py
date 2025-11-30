@@ -282,12 +282,12 @@ def get_face_image_bytes():
     picam2 = Picamera2()
     
     try:
-        # Configure camera for still capture at 640x480
-        config = picam2.create_still_configuration(main={"size": (640, 480)})
+        # Configure camera for still capture at 1280x720 (720p for better face recognition)
+        config = picam2.create_still_configuration(main={"size": (1280, 720)})
         picam2.configure(config)
         picam2.start()
         
-        print(f"   - Camera initialized at: 640x480")
+        print(f"   - Camera initialized at: 1280x720")
         print("   - Warming up (2s)...")
         time.sleep(2.0)
 
@@ -299,7 +299,7 @@ def get_face_image_bytes():
         for i in range(5):
             try:
                 # Capture frame as numpy array (RGB format)
-                burst_frame = picam2.capture_array()
+                burst_frame = picam2.capture_array() 
                 
                 # Convert RGB to BGR for cv2 compatibility
                 burst_frame_bgr = cv2.cvtColor(burst_frame, cv2.COLOR_RGB2BGR)
@@ -357,22 +357,25 @@ def perform_face_recognition():
         files = {'image': ('face.jpg', image_bytes, 'image/jpeg')}
         response = requests.post(PROCESS_FACE_ENDPOINT, files=files)
         
-        if response.status_code != 200:
+        # Accept both 200 (recognized) and 201 (enrolled) as success
+        if response.status_code not in [200, 201]:
             print(f"❌ Server Error: {response.text}")
             return
             
         result = response.json()
         status = result.get("status")
         
-        if status == "recognized":
+        if status == "recognized" or status == "enrolled":
             name = result.get("name")
-            print(f"\n✨ RECOGNIZED: {name} ✨")
+            if status == "enrolled":
+                print(f"\n🆕 NEW PERSON ENROLLED: {name} 🆕")
+            else:
+                print(f"\n✨ RECOGNIZED: {name} ✨")
             # Optional: You could trigger a TTS greeting here via socketio if desired
             # sio.emit("tts_speak", f"Hello {name}") 
             
         elif status == "unknown":
             print("\n❓ Face Unknown.")
-            # Auto-enrollment logic could go here, or just notify user
             
         elif status == "error":
             print(f"❌ Error: {result.get('message')}")
