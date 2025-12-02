@@ -1,4 +1,4 @@
-# client.py
+# client.py (improved)
 import socketio
 import sounddevice as sd
 import numpy as np
@@ -6,6 +6,7 @@ import threading
 import queue
 import time
 import sys
+import signal
 
 # GPIO (pigpio backend)
 from gpiozero import Button
@@ -39,7 +40,11 @@ sio = socketio.Client()
 
 @sio.event
 def connect():
-    print("✅ Connected to server")
+    print(f"✅ Connected to server. SID: {sio.sid}")
+
+@sio.event
+def reconnect():
+    print(f"🔄 Reconnected to server. New SID: {sio.sid}")
 
 @sio.event
 def disconnect():
@@ -52,13 +57,19 @@ playback_queue = queue.Queue()
 playback_enabled = threading.Event()     # when set, allow enqueueing & playing incoming server audio
 playback_worker_running = threading.Event()
 
+# Start playback enabled by default (so server replies will play unless disabled for a query)
+playback_enabled.set()
+
 # server -> client chunk handler
 @sio.on("server_audio_chunk")
 def on_server_audio_chunk(data):
     # Only accept and enqueue server chunks if playback is enabled
     if not playback_enabled.is_set():
-        # drop chunk if playback disabled
+        print(f"⚠️ Dropping audio chunk ({len(data)} bytes) because playback is disabled.")
         return
+    
+    # Debug: print every chunk size
+    # print(f"🔊 Rx chunk: {len(data)} bytes") 
     arr = np.frombuffer(data, dtype=np.int16)
     playback_queue.put(arr)
 
@@ -80,10 +91,9 @@ def playback_worker():
             print("🔊 Playback stream opened")
             playback_worker_running.set()
             while playback_worker_running.is_set():
-                # If playback disabled, sleep briefly
+                # If playback disabled, sleep briefly and clear queued frames
                 if not playback_enabled.is_set():
                     time.sleep(0.05)
-                    # clear any queued frames to avoid playing stale audio once re-enabled
                     try:
                         while not playback_queue.empty():
                             playback_queue.get_nowait()
@@ -125,19 +135,28 @@ recording_query = False
 recording_context = False
 context_paused_by_query = False  # used to remember to resume context after query finishes
 
+# protect reading/writing of recording flags
+recording_lock = threading.Lock()
+
 def ensure_stream_running():
     global stream
     with stream_lock:
         if stream is None:
-            stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='int16',
-                                     blocksize=BLOCKSIZE, callback=audio_callback)
-            stream.start()
-            print("🎧 Input stream started")
+            try:
+                stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='int16',
+                                         blocksize=BLOCKSIZE, callback=audio_callback)
+                stream.start()
+                print("🎧 Input stream started")
+            except Exception as e:
+                stream = None
+                print(f"❌ Failed to start input stream: {e}")
 
 def stop_stream_if_unused():
     global stream
     with stream_lock:
-        if stream is not None and not recording_query and not recording_context:
+        with recording_lock:
+            unused = not recording_query and not recording_context
+        if stream is not None and unused:
             try:
                 stream.stop()
                 stream.close()
@@ -154,13 +173,17 @@ def audio_callback(indata, frames, time_info, status):
     if status:
         print(f"⚠️ Input status: {status}", file=sys.stderr)
     # prefer query chunks if both flags somehow true
-    if recording_query:
+    with recording_lock:
+        rq = recording_query
+        rc = recording_context
+
+    if rq:
         raw = indata.tobytes()
         try:
             sio.emit("audio_chunk", raw)
         except Exception as e:
             print(f"❌ Failed to emit audio_chunk: {e}")
-    elif recording_context:
+    elif rc:
         raw = indata.tobytes()
         try:
             sio.emit("context_audio_chunk", raw)
@@ -175,35 +198,38 @@ def audio_callback(indata, frames, time_info, status):
 # -----------------------------
 def start_query_recording():
     global recording_query, recording_context, context_paused_by_query
-    if recording_query:
-        return
-    # If context recording is active, pause it and remember to resume after query completes
-    if recording_context:
-        context_paused_by_query = True
-        recording_context = False
+    with recording_lock:
+        if recording_query:
+            return
+        # If context recording is active, pause it and remember to resume after query completes
+        if recording_context:
+            context_paused_by_query = True
+            recording_context = False
+            try:
+                sio.emit("context_pause")
+                print("🟣 Context recording paused because query recording started")
+            except Exception as e:
+                print(f"❌ Failed to emit context_pause: {e}")
+
+        # Before starting query: disable playback and inform server to stop streaming (if any)
+        playback_enabled.clear()
         try:
-            sio.emit("context_pause")
-            print("🟣 Context recording paused because query recording started")
+            sio.emit("stop_server_stream")  # ask server to stop sending previous reply immediately
         except Exception as e:
-            print(f"❌ Failed to emit context_pause: {e}")
+            print(f"❌ Failed to emit stop_server_stream: {e}")
 
-    # Before starting query: disable playback and inform server to stop streaming (if any)
-    playback_enabled.clear()
-    try:
-        sio.emit("stop_server_stream")  # ask server to stop sending previous reply immediately
-    except Exception as e:
-        print(f"❌ Failed to emit stop_server_stream: {e}")
+        recording_query = True
 
-    recording_query = True
     ensure_stream_running()
     print("🎙️ Query recording started (press-hold). Playback stopped/disabled.")
 
-
 def stop_query_recording():
     global recording_query, context_paused_by_query, recording_context
-    if not recording_query:
-        return
-    recording_query = False
+    with recording_lock:
+        if not recording_query:
+            return
+        recording_query = False
+
     # Tell server we're done so it can begin streaming reply
     try:
         sio.emit("audio_complete")
@@ -215,14 +241,15 @@ def stop_query_recording():
     playback_enabled.set()
 
     # If context was paused due to query, resume it automatically
-    if context_paused_by_query:
-        context_paused_by_query = False
-        recording_context = True
-        try:
-            sio.emit("context_resume")
-            print("🟣 Context recording resumed automatically after query finished")
-        except Exception as e:
-            print(f"❌ Failed to emit context_resume: {e}")
+    with recording_lock:
+        if context_paused_by_query:
+            context_paused_by_query = False
+            recording_context = True
+            try:
+                sio.emit("context_resume")
+                print("🟣 Context recording resumed automatically after query finished")
+            except Exception as e:
+                print(f"❌ Failed to emit context_resume: {e}")
 
     # If no recording left, stop input stream
     stop_stream_if_unused()
@@ -235,8 +262,11 @@ def start_context_recording(new_session=True):
     Start context recording. If new_session True, tell server to clear previous context buffer.
     """
     global recording_context
-    if recording_context:
-        return
+    with recording_lock:
+        if recording_context:
+            return
+        recording_context = True
+
     # inform server of start (clear) or resume
     if new_session:
         try:
@@ -249,7 +279,6 @@ def start_context_recording(new_session=True):
         except Exception as e:
             print(f"❌ Failed to emit context_resume: {e}")
 
-    recording_context = True
     ensure_stream_running()
     print("🟣 Context recording started (sending to server).")
 
@@ -258,9 +287,11 @@ def stop_context_recording():
     Stop context recording and tell server to finalize the context file.
     """
     global recording_context
-    if not recording_context:
-        return
-    recording_context = False
+    with recording_lock:
+        if not recording_context:
+            return
+        recording_context = False
+
     try:
         sio.emit("context_audio_complete")
         print("🟣 Context recording stopped. Sent context_audio_complete to server.")
@@ -268,7 +299,6 @@ def stop_context_recording():
         print(f"❌ Failed to emit context_audio_complete: {e}")
 
     stop_stream_if_unused()
-
 
 # -----------------------------
 # Face Recognition Functions
@@ -354,12 +384,15 @@ def perform_face_recognition():
 
     print("🚀 Sending to server for recognition...")
     try:
+        print(f"   (DEBUG) Using SocketIO SID: {sio.sid}")
         files = {'image': ('face.jpg', image_bytes, 'image/jpeg')}
-        response = requests.post(PROCESS_FACE_ENDPOINT, files=files)
+        data = {'sid': sio.sid} if sio.sid else {}
+        # add a short timeout so the client doesn't hang if server is unreachable
+        response = requests.post(PROCESS_FACE_ENDPOINT, files=files, data=data, timeout=10.0)
         
         # Accept both 200 (recognized) and 201 (enrolled) as success
         if response.status_code not in [200, 201]:
-            print(f"❌ Server Error: {response.text}")
+            print(f"❌ Server Error: {response.status_code} - {response.text}")
             return
             
         result = response.json()
@@ -371,15 +404,18 @@ def perform_face_recognition():
                 print(f"\n🆕 NEW PERSON ENROLLED: {name} 🆕")
             else:
                 print(f"\n✨ RECOGNIZED: {name} ✨")
-            # Optional: You could trigger a TTS greeting here via socketio if desired
-            # sio.emit("tts_speak", f"Hello {name}") 
             
+        elif status == "no_face":
+            print("\n⚠️ No face detected.")
+
         elif status == "unknown":
             print("\n❓ Face Unknown.")
             
         elif status == "error":
             print(f"❌ Error: {result.get('message')}")
             
+    except requests.Timeout:
+        print("❌ Face recognition request timed out.")
     except Exception as e:
         print(f"❌ Connection Error: {e}")
 
@@ -406,7 +442,9 @@ def setup_buttons():
     def on_btn1_release():
         # If we were recording query, stop it.
         # If we were NOT recording query, it means it was a short press -> Face Rec
-        if recording_query:
+        with recording_lock:
+            rq = recording_query
+        if rq:
             threading.Thread(target=stop_query_recording, daemon=True).start()
         else:
             # Short press
@@ -419,8 +457,9 @@ def setup_buttons():
     def on_btn2_press():
         # toggle context: start new session if currently not active; else stop it
         def worker():
-            # If currently recording context, stop it
-            if recording_context:
+            with recording_lock:
+                rc = recording_context
+            if rc:
                 stop_context_recording()
             else:
                 # Start a NEW context session when user toggles button (not a resume)
@@ -434,10 +473,42 @@ def setup_buttons():
     return btn1, btn2
 
 # -----------------------------
+# Graceful shutdown handling
+# -----------------------------
+def _graceful_shutdown(signum=None, frame=None):
+    print("\nShutting down (signal received). Cleaning up...")
+    try:
+        with recording_lock:
+            if recording_query:
+                stop_query_recording()
+            if recording_context:
+                stop_context_recording()
+    except Exception:
+        pass
+
+    # stop playback worker
+    playback_worker_running.clear()
+    playback_enabled.clear()
+    time.sleep(0.05)
+    try:
+        sio.disconnect()
+    except Exception:
+        pass
+    # allow process to exit
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _graceful_shutdown)
+signal.signal(signal.SIGTERM, _graceful_shutdown)
+
+# -----------------------------
 # Main loop (only 'q' to quit; button controls recording)
 # -----------------------------
 def run_client():
-    sio.connect(SERVER_URL)
+    try:
+        sio.connect(SERVER_URL)
+    except Exception as e:
+        print(f"❌ Could not connect to server: {e}")
+        # still allow local ops like face capture, but most features require server
     print("Push the physical button(s) to record. Type 'q' + Enter to quit.")
     # Setup button handlers (pigpio)
     try:
@@ -448,16 +519,25 @@ def run_client():
 
     try:
         while True:
-            cmd = input(">> ").strip().lower()
+            try:
+                cmd = input(">> ").strip().lower()
+            except EOFError:
+                # e.g. ran without tty; just sleep
+                time.sleep(0.2)
+                continue
             if cmd == "q":
                 print("Exiting...")
                 break
             # Ignore other input; recording handled by buttons
     finally:
         # cleanup: if any recording is active, stop them and notify server
-        if recording_query:
+        with recording_lock:
+            rq = recording_query
+            rc = recording_context
+
+        if rq:
             stop_query_recording()
-        if recording_context:
+        if rc:
             stop_context_recording()
 
         playback_worker_running.clear()
@@ -471,7 +551,10 @@ def run_client():
                 btn2.close()
         except Exception:
             pass
-        sio.disconnect()
+        try:
+            sio.disconnect()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     run_client()
